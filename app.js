@@ -1,13 +1,16 @@
 // app.js
+require('dotenv').config({ path: 'application.properties' });
+
 const express = require('express');
 const axios   = require('axios');
 const net     = require('net');
 const os      = require('os');
 const path    = require('path');
 const { createLogger, format, transports } = require('winston');
+const db      = require('./db');
 
 const app  = express();
-const port = 3300;
+const port = parseInt(process.env.PORT, 10) || 3000;
 
 // ─── Logger ───────────────────────────────────────────────────────────────────
 const HOSTNAME    = os.hostname();
@@ -162,14 +165,24 @@ async function runChecks(triggeredBy = 'scheduler') {
   logger.info(`Starting checks trigger=${triggeredBy}`);
   broadcast('start', { triggeredBy, ts: new Date().toISOString() });
 
+  const runStart   = Date.now();
   const urlResults = [];
   const ncResults  = [];
+
+  // Create run document in MongoDB (fire-and-forget — don't block checks)
+  let runId = null;
+  if (db.isConnected()) {
+    runId = await db.startRun(triggeredBy).catch(err => {
+      logger.error(`DB startRun failed: ${err.message}`);
+      return null;
+    });
+  }
 
   // ── URL checks: fire all in parallel, broadcast each result immediately ──
   const urlPromises = CHECK_URLS.map(async (url) => {
     const entry = await checkUrl(url);
     urlResults.push(entry);
-    broadcast('url', entry);  // pushed to SSE the instant this check resolves
+    broadcast('url', entry);
     if (entry.ok) logger.info(`URL OK ${url} status=${entry.status} ms=${entry.ms}`);
     else          logger.error(`URL FAIL ${url} status=${entry.status} error="${entry.error}"`);
     return entry;
@@ -188,13 +201,23 @@ async function runChecks(triggeredBy = 'scheduler') {
   // Both batches run concurrently — total wall time = slowest single check
   await Promise.all([Promise.all(urlPromises), Promise.all(ncPromises)]);
 
-  const ts = new Date().toISOString();
+  const durationMs = Date.now() - runStart;
+  const ts         = new Date().toISOString();
+
   lastUrlResults = { timestamp: ts, results: urlResults };
   lastNcResults  = { timestamp: ts, results: ncResults  };
   checksRunning  = false;
 
   broadcast('done', { timestamp: ts });
-  logger.info('Checks complete');
+  logger.info(`Checks complete durationMs=${durationMs}`);
+
+  // Persist to MongoDB async — doesn't block the next scheduled run
+  if (runId && db.isConnected()) {
+    db.finishRun(runId, urlResults, ncResults, durationMs).catch(err =>
+      logger.error(`DB finishRun failed: ${err.message}`)
+    );
+  }
+
   scheduleNextRun();
 }
 
@@ -230,7 +253,7 @@ function pageTemplate(title, content, refreshPath = null) {
           <li class="nav-item"><a class="nav-link" href="/names">Names</a></li>
           <li class="nav-item"><a class="nav-link" href="/details">Details</a></li>
           <li class="nav-item"><a class="nav-link" href="/curls">Curls</a></li>
-        </ul>
+          <li class="nav-item"><a class="nav-link" href="/curls/history">History</a></li>
       </div>
     </div>
   </nav>
@@ -566,6 +589,175 @@ app.post('/curls/run', (req, res) => {
   }
 });
 
+// ─── /curls/history — list of past runs from MongoDB ─────────────────────────
+app.get('/curls/history', async (_req, res) => {
+  logger.debug('ROUTE GET /curls/history');
+
+  const noDbMsg = `
+    <h2>Run History</h2>
+    <p class="text-muted">MongoDB is not connected. History is unavailable.</p>
+    <div class="mt-4">
+      <a href="/" class="btn btn-primary me-2">Home</a>
+      <a href="/curls" class="btn btn-secondary">Back to Curls</a>
+    </div>`;
+
+  if (!db.isConnected()) {
+    return res.send(pageTemplate('Run History', noDbMsg));
+  }
+
+  try {
+    const runs = await db.getRecentRuns(30);
+
+    if (!runs.length) {
+      return res.send(pageTemplate('Run History', `
+        <h2>Run History</h2>
+        <p class="text-muted">No completed runs recorded yet.</p>
+        <div class="mt-4">
+          <a href="/" class="btn btn-primary me-2">Home</a>
+          <a href="/curls" class="btn btn-secondary">Back to Curls</a>
+        </div>
+      `));
+    }
+
+    const rows = runs.map(r => {
+      const duration = r.durationMs != null ? `${r.durationMs} ms` : '—';
+      const started  = new Date(r.startedAt).toISOString().replace('Z', '+02:00');
+      return `<tr>
+        <td><small>${started}</small></td>
+        <td><span class="badge bg-secondary">${r.triggeredBy}</span></td>
+        <td>${duration}</td>
+        <td><a href="/curls/history/${r._id}" class="btn btn-sm btn-outline-light">View</a></td>
+      </tr>`;
+    }).join('\n');
+
+    res.send(pageTemplate('Run History', `
+      <h2>Run History</h2>
+      <p class="text-muted mb-3">Last ${runs.length} completed runs</p>
+      <table class="table table-sm table-bordered table-hover text-start">
+        <thead class="table-dark">
+          <tr><th>Started</th><th>Trigger</th><th>Duration</th><th></th></tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div class="mt-3">
+        <a href="/" class="btn btn-primary me-2">Home</a>
+        <a href="/curls" class="btn btn-secondary">Back to Curls</a>
+      </div>
+    `));
+  } catch (err) {
+    logger.error(`History query failed: ${err.message}`);
+    res.status(500).send(pageTemplate('Run History', `
+      <h2>Error loading history</h2>
+      <p class="text-muted">${err.message}</p>
+      <div class="mt-4">
+        <a href="/" class="btn btn-primary me-2">Home</a>
+        <a href="/curls" class="btn btn-secondary">Back to Curls</a>
+      </div>
+    `));
+  }
+});
+
+// ─── /curls/history/:runId — full results for one run ────────────────────────
+app.get('/curls/history/:runId', async (req, res) => {
+  logger.debug(`ROUTE GET /curls/history/${req.params.runId}`);
+
+  if (!db.isConnected()) {
+    return res.send(pageTemplate('Run Detail', `
+      <h2>MongoDB not connected</h2>
+      <p class="text-muted">History details are unavailable.</p>
+      <div class="mt-4">
+        <a href="/" class="btn btn-primary me-2">Home</a>
+        <a href="/curls/history" class="btn btn-secondary">Back to History</a>
+      </div>
+    `));
+  }
+
+  try {
+    const { run, urlResults, ncResults } = await db.getRunResults(req.params.runId);
+
+    if (!run) {
+      return res.status(404).send(pageTemplate('Not Found', `
+        <h2>Run not found</h2>
+        <p class="text-muted">ID: ${req.params.runId}</p>
+        <div class="mt-4">
+          <a href="/" class="btn btn-primary me-2">Home</a>
+          <a href="/curls/history" class="btn btn-secondary">Back to History</a>
+        </div>
+      `));
+    }
+
+    const urlOk   = urlResults.filter(r => r.ok).length;
+    const urlFail = urlResults.length - urlOk;
+    const ncOk    = ncResults.filter(r => r.open).length;
+    const ncFail  = ncResults.length - ncOk;
+    const started = new Date(run.startedAt).toISOString().replace('Z', '+02:00');
+
+    const urlRows = urlResults.map(r => {
+      const badge  = r.ok ? 'success' : 'danger';
+      const label  = r.ok ? 'OK'      : 'FAIL';
+      const detail = r.ok ? `HTTP ${r.status} — ${r.ms} ms` : `HTTP ${r.status} — ${r.error || ''}`;
+      return `<tr>
+        <td><span class="badge bg-${badge}">${label}</span></td>
+        <td><a href="${r.url}" target="_blank" rel="noopener">${r.url}</a></td>
+        <td>${detail}</td>
+      </tr>`;
+    }).join('\n');
+
+    const ncRows = ncResults.map(r => {
+      const badge = r.open ? 'success' : 'danger';
+      const label = r.open ? 'OPEN'    : 'FAIL';
+      return `<tr>
+        <td><span class="badge bg-${badge}">${label}</span></td>
+        <td>${r.target}</td>
+        <td>${r.durationMs} ms</td>
+      </tr>`;
+    }).join('\n');
+
+    res.send(pageTemplate(`Run — ${started}`, `
+      <h2>Run Detail</h2>
+      <p class="text-muted mb-1">Started: <strong>${started}</strong></p>
+      <p class="mb-3">
+        Trigger: <span class="badge bg-secondary me-2">${run.triggeredBy}</span>
+        Duration: <strong>${run.durationMs != null ? run.durationMs + ' ms' : '—'}</strong>
+      </p>
+      <p>
+        <span class="badge bg-success me-1">URLs OK: ${urlOk}</span>
+        <span class="badge bg-danger me-1">URLs FAIL: ${urlFail}</span>
+        <span class="badge bg-success me-1">Ports OPEN: ${ncOk}</span>
+        <span class="badge bg-danger me-2">Ports FAIL: ${ncFail}</span>
+      </p>
+
+      <h5 class="text-start mt-4">URL Checks</h5>
+      <table class="table table-sm table-bordered table-hover text-start">
+        <thead class="table-dark"><tr><th style="width:80px">Status</th><th>URL</th><th>Detail</th></tr></thead>
+        <tbody>${urlRows || '<tr><td colspan="3" class="text-muted">No data</td></tr>'}</tbody>
+      </table>
+
+      <h5 class="text-start mt-4">Netcat Probes</h5>
+      <table class="table table-sm table-bordered table-hover text-start">
+        <thead class="table-dark"><tr><th style="width:80px">Status</th><th>Target</th><th>Duration</th></tr></thead>
+        <tbody>${ncRows || '<tr><td colspan="3" class="text-muted">No data</td></tr>'}</tbody>
+      </table>
+
+      <div class="mt-4">
+        <a href="/" class="btn btn-primary me-2">Home</a>
+        <a href="/curls" class="btn btn-secondary me-2">Back to Curls</a>
+        <a href="/curls/history" class="btn btn-outline-light">History</a>
+      </div>
+    `));
+  } catch (err) {
+    logger.error(`Run detail query failed: ${err.message}`);
+    res.status(500).send(pageTemplate('Error', `
+      <h2>Error loading run</h2>
+      <p class="text-muted">${err.message}</p>
+      <div class="mt-4">
+        <a href="/" class="btn btn-primary me-2">Home</a>
+        <a href="/curls/history" class="btn btn-secondary">Back to History</a>
+      </div>
+    `));
+  }
+});
+
 // ─── 404 handler ─────────────────────────────────────────────────────────────
 app.use((req, res) => {
   logger.warn(`NOT FOUND ${req.method} ${req.path}`);
@@ -589,5 +781,5 @@ app.use((err, req, res, _next) => {
 app.listen(port, () => {
   logger.info('Application started');
   logger.info(`Server running at http://localhost:${port}`);
-  runChecks('startup');
+  db.connect(logger).then(() => runChecks('startup'));
 });
