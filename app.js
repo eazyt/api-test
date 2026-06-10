@@ -20,10 +20,14 @@ const LOG_FILE    = path.join(__dirname, 'server.log');
 
 /** Format a date as ISO-8601 with GMT+2 offset (e.g. 2026-06-09T14:00:00.000+02:00) */
 function timestampGMT2() {
-  const now        = new Date();
-  const offsetMs   = 2 * 60 * 60 * 1000;                  // GMT+2 in ms
-  const local      = new Date(now.getTime() + offsetMs);   // shift to +02:00
-  return local.toISOString().replace('Z', '+02:00');
+  return toGMT2(new Date());
+}
+
+/** Convert any Date (or date-castable value) to a GMT+2 ISO-8601 string */
+function toGMT2(date) {
+  const offsetMs = 2 * 60 * 60 * 1000;
+  const shifted  = new Date(new Date(date).getTime() + offsetMs);
+  return shifted.toISOString().replace('Z', '+02:00');
 }
 
 const customFormat = format.printf(({ level, message, timestamp }) =>
@@ -590,8 +594,11 @@ app.post('/curls/run', (req, res) => {
 });
 
 // ─── /curls/history — list of past runs from MongoDB ─────────────────────────
-app.get('/curls/history', async (_req, res) => {
-  logger.debug('ROUTE GET /curls/history');
+// ─── /curls/history — paginated list of past runs from MongoDB ───────────────
+app.get('/curls/history', async (req, res) => {
+  const page     = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const pageSize = 25;
+  logger.debug(`ROUTE GET /curls/history page=${page}`);
 
   const noDbMsg = `
     <h2>Run History</h2>
@@ -606,9 +613,9 @@ app.get('/curls/history', async (_req, res) => {
   }
 
   try {
-    const runs = await db.getRecentRuns(30);
+    const { runs, total, totalPages } = await db.getRecentRuns(page, pageSize);
 
-    if (!runs.length) {
+    if (!total) {
       return res.send(pageTemplate('Run History', `
         <h2>Run History</h2>
         <p class="text-muted">No completed runs recorded yet.</p>
@@ -621,7 +628,7 @@ app.get('/curls/history', async (_req, res) => {
 
     const rows = runs.map(r => {
       const duration = r.durationMs != null ? `${r.durationMs} ms` : '—';
-      const started  = new Date(r.startedAt).toISOString().replace('Z', '+02:00');
+      const started  = toGMT2(r.startedAt);
       return `<tr>
         <td><small>${started}</small></td>
         <td><span class="badge bg-secondary">${r.triggeredBy}</span></td>
@@ -630,15 +637,40 @@ app.get('/curls/history', async (_req, res) => {
       </tr>`;
     }).join('\n');
 
+    // Build pagination controls
+    const prevDisabled = page <= 1;
+    const nextDisabled = page >= totalPages;
+    const from         = (page - 1) * pageSize + 1;
+    const to           = Math.min(page * pageSize, total);
+
+    const pagination = `
+      <nav class="mt-3" aria-label="history pagination">
+        <div class="d-flex justify-content-between align-items-center">
+          <small class="text-muted">Showing ${from}–${to} of ${total} runs</small>
+          <ul class="pagination pagination-sm mb-0">
+            <li class="page-item ${prevDisabled ? 'disabled' : ''}">
+              <a class="page-link" href="/curls/history?page=${page - 1}">&#8249; Prev</a>
+            </li>
+            ${Array.from({ length: totalPages }, (_, i) => i + 1).map(p => `
+              <li class="page-item ${p === page ? 'active' : ''}">
+                <a class="page-link" href="/curls/history?page=${p}">${p}</a>
+              </li>`).join('')}
+            <li class="page-item ${nextDisabled ? 'disabled' : ''}">
+              <a class="page-link" href="/curls/history?page=${page + 1}">Next &#8250;</a>
+            </li>
+          </ul>
+        </div>
+      </nav>`;
+
     res.send(pageTemplate('Run History', `
       <h2>Run History</h2>
-      <p class="text-muted mb-3">Last ${runs.length} completed runs</p>
       <table class="table table-sm table-bordered table-hover text-start">
         <thead class="table-dark">
-          <tr><th>Started</th><th>Trigger</th><th>Duration</th><th></th></tr>
+          <tr><th>Started (GMT+2)</th><th>Trigger</th><th>Duration</th><th></th></tr>
         </thead>
         <tbody>${rows}</tbody>
       </table>
+      ${pagination}
       <div class="mt-3">
         <a href="/" class="btn btn-primary me-2">Home</a>
         <a href="/curls" class="btn btn-secondary">Back to Curls</a>
@@ -690,7 +722,7 @@ app.get('/curls/history/:runId', async (req, res) => {
     const urlFail = urlResults.length - urlOk;
     const ncOk    = ncResults.filter(r => r.open).length;
     const ncFail  = ncResults.length - ncOk;
-    const started = new Date(run.startedAt).toISOString().replace('Z', '+02:00');
+    const started = toGMT2(run.startedAt);
 
     const urlRows = urlResults.map(r => {
       const badge  = r.ok ? 'success' : 'danger';

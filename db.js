@@ -75,12 +75,18 @@ async function finishRun(runId, urlResults, ncResults, durationMs) {
   ]);
 }
 
-/** Return the last N completed runs (summary only) */
-async function getRecentRuns(limit = 20) {
-  return Run.find({ completedAt: { $ne: null } })
-    .sort({ startedAt: -1 })
-    .limit(limit)
-    .lean();
+/** Return one page of completed runs and the total count for pagination */
+async function getRecentRuns(page = 1, pageSize = 25) {
+  const skip  = (page - 1) * pageSize;
+  const [runs, total] = await Promise.all([
+    Run.find({ completedAt: { $ne: null } })
+      .sort({ startedAt: -1 })
+      .skip(skip)
+      .limit(pageSize)
+      .lean(),
+    Run.countDocuments({ completedAt: { $ne: null } }),
+  ]);
+  return { runs, total, page, pageSize, totalPages: Math.ceil(total / pageSize) };
 }
 
 /** Return URL + NC results for a single run */
